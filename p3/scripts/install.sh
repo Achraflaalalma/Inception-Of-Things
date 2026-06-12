@@ -16,3 +16,5 @@ chmod +x kubectl
 sudo mv kubectl /usr/local/bin/
 
 curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+# kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
