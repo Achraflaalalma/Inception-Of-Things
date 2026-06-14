@@ -1,5 +1,8 @@
 #!/bin/bash
 
+apt-get update
+apt-get install -y curl
+
 while [ ! -f /vagrant/token ]
 do
     sleep 2
