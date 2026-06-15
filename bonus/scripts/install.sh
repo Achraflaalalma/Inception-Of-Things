@@ -1,11 +1,18 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # ============================================================
+# Bonus installer
+# No conflict with p3:
+# - p3 uses:    dev-cluster + Argo CD 8080
+# - bonus uses: bonus-cluster + GitLab 8081 + Argo CD 8082
+# ============================================================
+
+# -----------------------------
 # Configuration
-# ============================================================
+# -----------------------------
 
-CLUSTER_NAME="dev-cluster"
+CLUSTER_NAME="bonus-cluster"
 
 GITHUB_REPO_URL="https://github.com/Achraflaalalma/alaalalm-iot.git"
 
@@ -13,46 +20,72 @@ GITLAB_PROJECT_NAME="alaalalm-iot"
 GITLAB_PROJECT_PATH="alaalalm-iot"
 GITLAB_TOKEN="glpat-local-token-1234567890"
 
-GITLAB_LOCAL_URL="http://localhost:8081"
+GITLAB_LOCAL_PORT="8081"
+ARGOCD_LOCAL_PORT="8082"
+
+GITLAB_LOCAL_URL="http://localhost:${GITLAB_LOCAL_PORT}"
 GITLAB_CLUSTER_URL="http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
 
-ARGOCD_LOCAL_URL="https://localhost:8080"
+ARGOCD_LOCAL_URL="https://localhost:${ARGOCD_LOCAL_PORT}"
+
+GITLAB_PF_PID="/tmp/bonus-gitlab-port-forward.pid"
+ARGOCD_PF_PID="/tmp/bonus-argocd-port-forward.pid"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BONUS_DIR="$(dirname "$SCRIPT_DIR")"
 
-# ============================================================
+# -----------------------------
 # Helpers
-# ============================================================
+# -----------------------------
 
 info() {
     echo ""
     echo "=> $1"
 }
 
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+require_file() {
+    if [ ! -f "$1" ]; then
+        die "Missing file: $1"
+    fi
+}
+
+# -----------------------------
+# Host setup
+# -----------------------------
+
 install_host_dependencies() {
     info "Installing host dependencies"
 
     sudo apt update
     sudo apt install -y docker.io curl git ca-certificates
+}
+
+start_docker() {
+    info "Starting Docker"
 
     sudo systemctl enable docker
     sudo systemctl start docker
 }
 
-ensure_docker_group() {
-    info "Checking Docker group"
+ensure_docker_access() {
+    info "Checking Docker access"
 
     sudo usermod -aG docker "$USER" || true
 
-    if ! groups | grep -q docker; then
+    if ! docker ps >/dev/null 2>&1; then
         echo "Re-executing script with docker group..."
-        exec sg docker "$0"
+        exec sg docker "bash \"$SCRIPT_DIR/install.sh\""
     fi
 }
 
 install_kubectl() {
     if command -v kubectl >/dev/null 2>&1; then
+        echo "kubectl already installed"
         return
     fi
 
@@ -65,6 +98,7 @@ install_kubectl() {
 
 install_k3d() {
     if command -v k3d >/dev/null 2>&1; then
+        echo "k3d already installed"
         return
     fi
 
@@ -75,6 +109,7 @@ install_k3d() {
 
 install_helm() {
     if command -v helm >/dev/null 2>&1; then
+        echo "Helm already installed"
         return
     fi
 
@@ -83,11 +118,17 @@ install_helm() {
     curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 }
 
-create_cluster() {
-    info "Creating k3d cluster"
+# -----------------------------
+# Cluster
+# -----------------------------
 
-    if ! k3d cluster list | grep -q "$CLUSTER_NAME"; then
+create_cluster() {
+    info "Creating k3d cluster: $CLUSTER_NAME"
+
+    if ! k3d cluster list | grep -q "^${CLUSTER_NAME}"; then
         k3d cluster create "$CLUSTER_NAME" --servers 1 --agents 0 --no-lb
+    else
+        echo "Cluster already exists: $CLUSTER_NAME"
     fi
 
     k3d kubeconfig merge "$CLUSTER_NAME" --kubeconfig-switch-context
@@ -100,6 +141,10 @@ create_namespaces() {
     kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
     kubectl create namespace gitlab --dry-run=client -o yaml | kubectl apply -f -
 }
+
+# -----------------------------
+# Argo CD
+# -----------------------------
 
 install_argocd() {
     info "Installing Argo CD"
@@ -114,10 +159,44 @@ install_argocd() {
         --timeout=300s
 }
 
+start_argocd_port_forward() {
+    info "Starting Argo CD port-forward on ${ARGOCD_LOCAL_URL}"
+
+    if [ -f "$ARGOCD_PF_PID" ]; then
+        kill "$(cat "$ARGOCD_PF_PID")" 2>/dev/null || true
+        rm -f "$ARGOCD_PF_PID"
+    fi
+
+    kubectl port-forward svc/argocd-server \
+        -n argocd \
+        "${ARGOCD_LOCAL_PORT}:443" >/tmp/bonus-argocd-port-forward.log 2>&1 &
+
+    echo $! > "$ARGOCD_PF_PID"
+
+    sleep 2
+}
+
+get_argocd_password() {
+    ARGO_PASS="$(kubectl -n argocd get secret argocd-initial-admin-secret \
+        -o jsonpath="{.data.password}" | base64 -d)"
+}
+
+apply_argocd_application() {
+    info "Applying Argo CD Application"
+
+    require_file "$BONUS_DIR/confs/application.yaml"
+
+    kubectl apply -f "$BONUS_DIR/confs/application.yaml"
+}
+
+# -----------------------------
+# GitLab
+# -----------------------------
+
 install_gitlab() {
     info "Installing GitLab"
 
-    helm repo add gitlab https://charts.gitlab.io || true
+    helm repo add gitlab https://charts.gitlab.io >/dev/null 2>&1 || true
     helm repo update
 
     helm upgrade --install gitlab gitlab/gitlab \
@@ -160,13 +239,18 @@ wait_for_gitlab() {
 }
 
 start_gitlab_port_forward() {
-    info "Starting GitLab port-forward"
+    info "Starting GitLab port-forward on ${GITLAB_LOCAL_URL}"
 
-    pkill -f "kubectl port-forward svc/gitlab-webservice-default" || true
+    if [ -f "$GITLAB_PF_PID" ]; then
+        kill "$(cat "$GITLAB_PF_PID")" 2>/dev/null || true
+        rm -f "$GITLAB_PF_PID"
+    fi
 
     kubectl port-forward svc/gitlab-webservice-default \
         -n gitlab \
-        8081:8181 >/tmp/gitlab-port-forward.log 2>&1 &
+        "${GITLAB_LOCAL_PORT}:8181" >/tmp/bonus-gitlab-port-forward.log 2>&1 &
+
+    echo $! > "$GITLAB_PF_PID"
 
     sleep 10
 
@@ -178,17 +262,17 @@ start_gitlab_port_forward() {
 }
 
 get_gitlab_password() {
-    GITLAB_ROOT_PASSWORD=$(kubectl get secret gitlab-gitlab-initial-root-password \
+    GITLAB_ROOT_PASSWORD="$(kubectl get secret gitlab-gitlab-initial-root-password \
         -n gitlab \
-        -o jsonpath="{.data.password}" | base64 -d)
+        -o jsonpath="{.data.password}" | base64 -d)"
 }
 
 create_gitlab_project() {
     info "Creating GitLab token and project"
 
-    TOOLBOX_POD=$(kubectl get pod -n gitlab \
+    TOOLBOX_POD="$(kubectl get pod -n gitlab \
         -l app=toolbox \
-        -o jsonpath="{.items[0].metadata.name}")
+        -o jsonpath="{.items[0].metadata.name}")"
 
     kubectl exec -n gitlab "$TOOLBOX_POD" -c toolbox -- gitlab-rails runner "
 user = User.find_by_username('root')
@@ -226,39 +310,26 @@ puts 'GitLab token and project are ready'
 push_repo_to_gitlab() {
     info "Cloning GitHub repo and pushing it to local GitLab"
 
-    TMP_REPO=$(mktemp -d)
+    TMP_REPO="$(mktemp -d)"
 
     git clone "$GITHUB_REPO_URL" "$TMP_REPO"
 
-    cd "$TMP_REPO"
+    pushd "$TMP_REPO" >/dev/null
 
-    git remote remove origin || true
-    git remote add origin "http://root:$GITLAB_TOKEN@localhost:8081/root/$GITLAB_PROJECT_PATH.git"
+    git remote remove origin 2>/dev/null || true
+    git remote add origin "http://root:${GITLAB_TOKEN}@localhost:${GITLAB_LOCAL_PORT}/root/${GITLAB_PROJECT_PATH}.git"
 
     git branch -M main
     git push -u origin main --force
+
+    popd >/dev/null
+
+    rm -rf "$TMP_REPO"
 }
 
-apply_argocd_application() {
-    info "Applying Argo CD Application"
-
-    kubectl apply -f "$BONUS_DIR/confs/application.yaml"
-}
-
-start_argocd_port_forward() {
-    info "Starting Argo CD port-forward"
-
-    pkill -f "kubectl port-forward svc/argocd-server" || true
-
-    kubectl port-forward svc/argocd-server \
-        -n argocd \
-        8080:443 >/tmp/argocd-port-forward.log 2>&1 &
-}
-
-get_argocd_password() {
-    ARGO_PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret \
-        -o jsonpath="{.data.password}" | base64 -d)
-}
+# -----------------------------
+# Summary
+# -----------------------------
 
 print_summary() {
     cat <<EOF
@@ -279,12 +350,24 @@ Username: admin
 Password: $ARGO_PASS
 
 =====================================
+ Cluster
+=====================================
+Name:     $CLUSTER_NAME
+
+=====================================
  Useful checks
 =====================================
 kubectl get pods -n gitlab
 kubectl get pods -n argocd
 kubectl get pods -n dev
 kubectl get application -n argocd
+kubectl get application bonus-playground -n argocd
+
+=====================================
+ Port-forward logs
+=====================================
+GitLab:   /tmp/bonus-gitlab-port-forward.log
+Argo CD:  /tmp/bonus-argocd-port-forward.log
 
 EOF
 }
@@ -294,7 +377,8 @@ EOF
 # ============================================================
 
 install_host_dependencies
-ensure_docker_group
+start_docker
+ensure_docker_access
 
 install_kubectl
 install_k3d
@@ -309,6 +393,7 @@ install_gitlab
 wait_for_gitlab
 start_gitlab_port_forward
 get_gitlab_password
+
 create_gitlab_project
 push_repo_to_gitlab
 

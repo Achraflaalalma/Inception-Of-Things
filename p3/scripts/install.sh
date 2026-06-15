@@ -1,59 +1,81 @@
 #!/bin/bash
-set -ex
+set -euo pipefail
 
-sudo apt update
-sudo apt install -y docker.io curl
-
-sudo systemctl enable docker
-sudo systemctl start docker
+CLUSTER_NAME="dev-cluster"
+ARGOCD_NAMESPACE="argocd"
+DEV_NAMESPACE="dev"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# kubectl
-curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-chmod +x kubectl
-sudo mv kubectl /usr/local/bin/
+echo "Installing dependencies..."
+sudo apt update
+sudo apt install -y docker.io curl ca-certificates
 
-# k3d
-curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+echo "Starting Docker..."
+sudo systemctl enable docker
+sudo systemctl start docker
 
-# ensure docker group exists and user is inside it
-sudo usermod -aG docker $USER || true
+echo "Adding user to docker group..."
+sudo usermod -aG docker "$USER" || true
 
-# IMPORTANT: re-run script in docker group context
-if ! groups | grep -q docker; then
+if ! docker ps >/dev/null 2>&1; then
     echo "Re-executing script with docker group..."
-
-    exec sg docker "$0"
+    exec sg docker "bash '$0'"
 fi
 
-# -----------------------------
-# From here: docker works
-# -----------------------------
+echo "Installing kubectl..."
+if ! command -v kubectl >/dev/null 2>&1; then
+    curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    chmod +x kubectl
+    sudo mv kubectl /usr/local/bin/
+fi
 
-k3d cluster create dev-cluster --servers 1 --agents 0 --no-lb
+echo "Installing k3d..."
+if ! command -v k3d >/dev/null 2>&1; then
+    curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+fi
 
-k3d kubeconfig merge dev-cluster --kubeconfig-switch-context
+echo "Creating k3d cluster..."
+if ! k3d cluster list | grep -q "^${CLUSTER_NAME}"; then
+    k3d cluster create "$CLUSTER_NAME" --servers 1 --agents 0 --no-lb
+else
+    echo "Cluster already exists: $CLUSTER_NAME"
+fi
 
-kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
+echo "Switching kubeconfig context..."
+k3d kubeconfig merge "$CLUSTER_NAME" --kubeconfig-switch-context
 
+echo "Creating namespaces..."
+kubectl create namespace "$ARGOCD_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace "$DEV_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+echo "Installing Argo CD..."
 kubectl apply \
   --server-side \
-  -n argocd \
+  -n "$ARGOCD_NAMESPACE" \
   -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
+echo "Waiting for Argo CD server..."
 kubectl rollout status deployment/argocd-server \
-  -n argocd --timeout=300s
+  -n "$ARGOCD_NAMESPACE" \
+  --timeout=300s
 
+echo "Applying Argo CD application..."
 kubectl apply -f "$ROOT_DIR/confs/application.yaml"
 
-echo "Starting Argo CD UI at https://localhost:8080"
+echo "Starting Argo CD port-forward..."
+pkill -f "kubectl port-forward svc/argocd-server" 2>/dev/null || true
 
-kubectl port-forward svc/argocd-server -n argocd 8080:443 >/dev/null 2>&1 &
+kubectl port-forward \
+  svc/argocd-server \
+  -n "$ARGOCD_NAMESPACE" \
+  8080:443 >/dev/null 2>&1 &
 
-ARGO_PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+sleep 2
+
+set +x
+ARGO_PASS="$(kubectl -n "$ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)"
 
 echo ""
 echo "====================================="

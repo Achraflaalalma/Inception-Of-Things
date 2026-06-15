@@ -9,7 +9,7 @@ spec:
   project: default
 
   source:
-    repoURL: repoURL: http://gitlab-webservice-default.gitlab.svc.cluster.local:8181/root/alaalalm-iot.git
+    repoURL: http://gitlab-webservice-default.gitlab.svc.cluster.local:8181/root/alaalalm-iot.git
     targetRevision: main
     path: confs
 
